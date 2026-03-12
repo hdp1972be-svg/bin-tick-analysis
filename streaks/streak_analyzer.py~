@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+import argparse
+import csv
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Patch
+import matplotlib.ticker as mticker
+import matplotlib.ticker as mticker
+
+UP = 1
+DOWN = -1
+
+MAX_VIOLINS = 5
+
+
+import matplotlib.ticker as mticker
+import json
+
+plt.rcParams['axes.formatter.useoffset'] = False
+plt.rcParams['axes.formatter.use_mathtext'] = False
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def ecdf(arr):
+    x = np.sort(arr)
+    y = np.arange(1, len(x) + 1) / len(x)
+    return x, y
+
+def stats_dict(arr):
+    med = np.median(arr)
+    return {
+        "min": np.min(arr),
+        "max": np.max(arr),
+        "mean": np.mean(arr),
+        "mad": np.median(np.abs(arr - med)),
+        "p90": np.percentile(arr, 90),
+    }
+
+def clip_violin_half(body, center_x, side):
+    verts = body.get_paths()[0].vertices
+    if side == "left":
+        verts[:, 0] = np.minimum(verts[:, 0], center_x)
+    else:
+        verts[:, 0] = np.maximum(verts[:, 0], center_x)
+
+def annotate_stats(ax, x, stats, side, color, violin=None, leader_length=0.05):
+    """
+    side: 'left' of 'right'
+    violin: het violon object (v['bodies'][0]) voor deze data
+    leader_length: lengte van de leader line
+    """
+    if violin is None:
+        # fallback: gewoon dx
+        dx = -leader_length if side == "left" else leader_length
+        ha = "right" if side == "left" else "left"
+        start_x = x
+        for k, y in stats.items():
+            ax.annotate(
+                f"{k}: {y:.2f}".rstrip('0').rstrip('.'),
+                xy=(start_x, y),
+                xytext=(start_x + dx, y),
+                arrowprops=dict(arrowstyle='-', lw=0.8),
+                fontsize=8,
+                ha=ha,
+                va="center",
+                color=color,
+                alpha=0.85
+            )
+        return
+
+    # haal vertices van de body
+    verts = violin.get_paths()[0].vertices
+    xs = verts[:, 0]
+    ys = verts[:, 1]
+
+    # voor elke stat: vind de x aan de rand bij die y
+    for k, y in stats.items():
+        # vind vertices dichtbij de y waarde
+        idx = np.argmin(np.abs(ys - y))
+        if side == "left":
+            start_x = min(xs[ys == ys[idx]])
+        else:
+            start_x = max(xs[ys == ys[idx]])
+
+        dx = -leader_length if side == "left" else leader_length
+        ha = "right" if side == "left" else "left"
+
+        ax.annotate(
+            f"{k}: {y:.2f}".rstrip('0').rstrip('.'),
+            xy=(start_x, y),
+            xytext=(start_x + dx, y),
+            arrowprops=dict(arrowstyle='-', lw=0.8),
+            fontsize=8,
+            ha=ha,
+            va="center",
+            color=color,
+            alpha=0.85
+        )
+
+def mad(arr):
+    """Median absolute deviation"""
+    med = np.median(arr)
+    return np.median(np.abs(arr - med))
+
+def suggest_grid_width(price_moves, streaks):
+    gaps = []
+    for s in streaks:
+        data = np.asarray(price_moves[s])
+        if len(data) < 20:
+            continue
+        med = np.median(data)
+        p90 = np.percentile(data, 90)
+        gaps.append(p90 - med)
+    if not gaps:
+        return None
+    return np.median(gaps)
+
+def suggested_grid_width(arr):
+    """Voorstel voor grid width gebaseerd op p90 - median"""
+    arr = np.array(arr)
+    med = np.median(arr)
+    p90 = np.percentile(arr, 90)
+    return float(p90 - med)
+
+def compute_regimes(arr):
+    """
+    Bepaal regime-grenzen zoals p90 en p99
+    """
+    arr = np.array(arr)
+    return {
+        "p25": float(np.percentile(arr, 25)),
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+        "p99": float(np.percentile(arr, 99)),
+        "p99.9": float(np.percentile(arr, 99.9)),
+        "max": float(arr.max())
+    }
+
+# ----------------------------
+# Data ingest
+# ----------------------------
+
+def read_csv(path):
+    price_moves = {}
+    price_moves_up = {}
+    price_moves_down = {}
+    bins = {}
+
+    prev_price = None
+    prev_dir = None
+    streak_len = 0
+    start_price = None
+
+    with open(path) as f:
+        r = csv.reader(f)
+        next(r)
+
+        for row in r:
+            price = float(row[2])
+
+            if prev_price is None:
+                prev_price = price
+                continue
+
+            if price > prev_price:
+                d = UP
+            elif price < prev_price:
+                d = DOWN
+            else:
+                prev_price = price
+                continue
+
+            if streak_len == 0:
+                start_price = prev_price
+
+            streak_len += 1
+
+            if prev_dir is not None and d != prev_dir:
+                delta = abs(prev_price - start_price)
+
+                price_moves.setdefault(streak_len, []).append(delta)
+                bins[streak_len] = bins.get(streak_len, 0) + 1
+
+                if prev_dir == UP:
+                    price_moves_up.setdefault(streak_len, []).append(delta)
+                else:
+                    price_moves_down.setdefault(streak_len, []).append(delta)
+
+                streak_len = 1
+                start_price = prev_price
+
+            prev_dir = d
+            prev_price = price
+
+    return bins, price_moves, price_moves_up, price_moves_down
+
+# ----------------------------
+# Plotting
+# ----------------------------
+
+def plot_main(args, price_moves, up, down, bins, csv):
+    all_streaks = sorted(price_moves.keys())
+    n = len(all_streaks)
+
+    n_rows = int(np.ceil(n / MAX_VIOLINS))
+    fig, axes = plt.subplots(n_rows, 1, figsize=(22, 4 * n_rows), sharex=False)
+
+    fig.text(
+        0.01, 0.98,
+        f"Source: {csv}",
+        fontsize=9,
+        color="gray",
+        ha="left",
+        va="top"
+    )
+
+    # als er maar 1 rij is, wrap in list voor uniformiteit
+    if n_rows == 1:
+        axes = [axes]
+
+    for i, s in enumerate(all_streaks):
+        row = i // MAX_VIOLINS
+        col = i % MAX_VIOLINS
+        ax = axes[row]
+
+        x = col + 1
+
+        def shifted(data):
+            return np.asarray(data)  # geen verticale shift meer nodig
+
+        if args.nosplit:
+            v = ax.violinplot(
+                shifted(price_moves[s]),
+                positions=[x],
+                showextrema=False
+            )
+            v['bodies'][0].set_alpha(0.6)
+        else:
+            if s in up:
+                vu = ax.violinplot(
+                    shifted(up[s]),
+                    positions=[x],
+                    showextrema=False
+                )
+                bu = vu['bodies'][0]
+                bu.set_facecolor("steelblue")
+                bu.set_alpha(0.6)
+                clip_violin_half(bu, x, "left")
+
+                annotate_stats(
+                    ax,
+                    x,
+                    stats_dict(up[s]),
+                    "left",
+                    "steelblue",
+                    violin=bu
+                )
+
+            if s in down:
+                vd = ax.violinplot(
+                    shifted(down[s]),
+                    positions=[x],
+                    showextrema=False
+                )
+                bd = vd['bodies'][0]
+                bd.set_facecolor("darkorange")
+                bd.set_alpha(0.6)
+                clip_violin_half(bd, x, "right")
+
+                annotate_stats(
+                    ax,
+                    x,
+                    stats_dict(down[s]),
+                    "right",
+                    "darkorange",
+                    violin=bd
+                )
+
+#        for ax in axes:
+#            ax.yaxis.set_major_formatter(mticker.ScalarFormatter())
+#            ax.yaxis.get_major_formatter().set_scientific(False)
+
+#                ax.yaxis.get_major_formatter().set_useOffset(False)
+
+#            for i, s in enumerate(all_streaks):
+#                row = i // MAX_VIOLINS
+#                col = i % MAX_VIOLINS
+#                ax = axes[row]
+#                x = col + 1
+
+#            arr = np.array(price_moves[s])
+#            regimes = compute_regimes(arr)
+
+#            # Achtergrond kleuren
+#            ax.axhspan(0, regimes["p90"], facecolor="lightgreen", alpha=0.1)
+#            ax.axhspan(regimes["p90"], regimes["p99"], facecolor="khaki", alpha=0.1)
+#            ax.axhspan(regimes["p99"], regimes["max"], facecolor="lightcoral", alpha=0.1)
+
+#            # Horizontale scheidingslijn boven death zone
+#            ax.hlines(regimes["p99"], x - 0.5, x + 0.5, colors="red", linestyles="--", linewidth=0.8)
+
+        if not args.noecdf:
+            if s in up:
+                x_ecdf, _ = ecdf(up[s])
+                ax.plot(np.full_like(x_ecdf, x - 0.15), x_ecdf, alpha=0.25)
+            if s in down:
+                x_ecdf, _ = ecdf(down[s])
+                ax.plot(np.full_like(x_ecdf, x + 0.15), x_ecdf, alpha=0.25)
+
+    # Axis labels per subplot
+    for row_idx, ax in enumerate(axes):
+        start = row_idx * MAX_VIOLINS
+        end = min(start + MAX_VIOLINS, n)
+        labels = [f"Str {all_streaks[i]-1} (N={bins.get(i+2, 0)})" for i in range(start, end)]
+        positions = list(range(1, len(labels)+1))
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels)
+        ax.set_ylabel("Δ price")
+        ax.grid(alpha=0.25)
+        if not args.nology:
+            ax.set_yscale("log")
+
+    #axes[-1].set_xlabel("Position within row")
+    fig.suptitle(f"Streak analysis", fontsize=16)
+
+    # Dummy patches voor legenda
+    legend_patches = [
+        Patch(facecolor='steelblue', edgecolor='k', label='UP'),
+        Patch(facecolor='darkorange', edgecolor='k', label='DOWN')
+    ]
+
+    # Plaats legenda boven de subplots, center
+    fig.legend(handles=legend_patches, loc='lower center', ncol=4, frameon=False, fontsize=8)
+    
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+    return fig
+
+def plot_histogram(bins):
+    fig, ax = plt.subplots(figsize=(12, 4))
+    print(len(bins))
+    xs = sorted(bins.keys())
+    ys = [bins[x] for x in xs]
+
+    ax.bar(xs, ys, width=0.8)
+    for x, y in zip(xs, ys):
+        ax.text(x, y, f"N={y}", ha="center", va="bottom", fontsize=8)
+
+    ax.set_xlabel("Streak length")
+    ax.set_ylabel("Count")
+    ax.set_title("Streak length distribution")
+    ax.grid(alpha=0.3)
+    return fig
+
+def plot_extremes(price_moves):
+    fig, axes = plt.subplots(len(price_moves), 3, figsize=(22, 4 * len(price_moves)))
+
+    for i, (s, data) in enumerate(sorted(price_moves.items())):
+        p90 = np.percentile(data, 90)
+        ext = [x for x in data if x >= p90]
+
+        if len(ext) < 5:
+            continue
+
+        axes[i, 0].hist(ext, bins=30)
+        axes[i, 0].set_title(f"Str {s-1} p90–p100")
+
+        ps = [90, 95, 99, 99.9, 100]
+        vals = [np.percentile(data, p) for p in ps]
+
+        axes[i, 2].barh(ps, vals)
+        for p, v in zip(ps, vals):
+            axes[i, 2].text(v, p, f"{v:.2e}", va="center")
+
+    plt.tight_layout()
+    return fig
+
+def export_json(streak_moves, streak_bins, out_path):
+    export = {}
+    for s, data in streak_moves.items():
+        arr = np.array(data)
+        r = compute_regimes(arr)
+
+        export[s-1] = {
+            "count": streak_bins.get(s, 0),
+            "stats": {
+                "min": float(arr.min()),
+                "max": float(arr.max()),
+                "mean": float(arr.mean()),
+                "median": float(np.median(arr)),
+                "mad": float(mad(arr)),
+                "p25": r["p25"],
+                "p50": r["p50"],
+                "p90": r["p90"],
+                "p99": r["p99"],
+                "p99.9": r["p99.9"],
+            },
+            "grid": {
+                "suggested_width": suggested_grid_width(arr),
+#                "suggested_width_method_2": suggested_grid_width2(arr),
+                "zone": [0, r["p90"]]
+            },
+            "burst": {
+                "zone": [r["p90"], r["p99"]]
+            },
+            "extreme": {
+                "zone": [r["p99"], r["max"]]
+            }
+        }
+
+    with open(out_path, "w") as f:
+        json.dump(export, f, indent=2)
+    print(f"JSON exported to {out_path}")
+
+# ----------------------------
+# Main
+# ----------------------------
+
+def main():
+    p = argparse.ArgumentParser()
+    #p.add_argument("csv")
+    p.add_argument("--nosplit", action="store_true")
+    p.add_argument("--noecdf", action="store_true")
+    p.add_argument("--nology", action="store_true")
+    p.add_argument("--noextremes", action="store_true")
+    args = p.parse_args()
+
+    csv = "trading_cloud/tick-data/BTCUSD/csv/BTCUSD_2025-04-01_0200GMT_merged_data_corrected.csv"
+
+    bins, pm, up, down = read_csv(csv)
+
+    plot_main(args, pm, up, down, bins, csv)
+    plot_histogram(bins)
+
+    export_json(pm, bins, "streaks_export.json")
+
+#    if not args.noextremes:
+#        plot_extremes(pm)
+
+    plt.show()
+
+if __name__ == "__main__":
+    main()
