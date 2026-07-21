@@ -109,5 +109,5 @@ def analyze_dir_combined(directory):
         print(f"Len: {s_len}, Delta: {delta:.2f}, Start: {dt}, Weekday: {weekday}")
 
 if __name__ == "__main__":
-    demo_dir = "trading_cloud/tick-data/BTCUSD/csv"
+    demo_dir = "./testdata"
     analyze_dir_combined(demo_dir)

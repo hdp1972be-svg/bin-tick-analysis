@@ -1,5 +1,4 @@
-
-#!/usr/bin/env python3
+#!/usr/local/bin/python3.11
 
 import argparse
 import json
@@ -8,7 +7,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 from collections import defaultdict
-
 
 def human_fmt(x, _):
     if x == 0:

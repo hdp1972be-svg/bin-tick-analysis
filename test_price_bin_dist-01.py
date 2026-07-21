@@ -95,5 +95,5 @@ def analyze_dir(directory):
             analyze_csv(os.path.join(directory, f))
 
 if __name__ == "__main__":
-    demo_dir = "trading_cloud/tick-data/BTCUSD/csv"
+    demo_dir = "./testdata"
     analyze_dir(demo_dir)

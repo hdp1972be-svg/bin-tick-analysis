@@ -146,5 +146,5 @@ def analyze_dir_combined(directory, top_pct=5):
 
 
 if __name__ == "__main__":
-    demo_dir = "trading_cloud/tick-data/BTCUSD/csv"
+    demo_dir = "./testdata"
     analyze_dir_combined(demo_dir, top_pct=1)

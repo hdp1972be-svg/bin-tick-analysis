@@ -1,3 +1,5 @@
+#!/usr/local/bin/python3.11
+
 
 import pandas as pd
 import numpy as np
@@ -15,7 +17,7 @@ GRID_LEVELS  = 20        # aantal levels boven/onder prijs
 # ---------------------------------------------------------
 
 df = pd.read_csv(
-    "trading_cloud/tick-data/BTCUSD/csv/BTCUSD_2025-04-01_0200GMT_merged_data_corrected.csv",
+    "./testdata/BTCUSD-testdata.csv",
 #    "BTCUSD_2025-04-01_0200GMT_merged_data_corrected.csv"
     parse_dates=["timestamp"]
 )

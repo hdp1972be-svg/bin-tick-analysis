@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/local/bin/python3.11
 import argparse
 import csv
 import numpy as np
@@ -2356,6 +2356,9 @@ def export_json(streak_moves, streak_bins, out_path, source, ticks, total_streak
 
     p90s = {s: np.percentile(v, 90) for s, v in streak_moves.items()}
 
+    # Bereken de timing stats
+    timing_data = calculate_streak_timing_stats(event_times, streak_sequence, streak_start_idx, streak_end_idx)
+
     export = {
         "_meta": {
             "source_file": source,
@@ -2367,6 +2370,8 @@ def export_json(streak_moves, streak_bins, out_path, source, ticks, total_streak
                 "ks_stat": float(ks),
                 "n_samples": len(iat),
             },
+            # NIEUW: Streak timing data
+            "streak_timing_ms": timing_data
         },
 
 #        "_hftsettings": {
@@ -2474,6 +2479,974 @@ def export_json(streak_moves, streak_bins, out_path, source, ticks, total_streak
         json.dump(export, f, indent=2)
     print(f"JSON exported to {out_path}")
 
+### EXTRA PLOTS 
+
+# 1.De "Fee-Adjusted Break-Even Ratio" (De n=3 Validator)
+# Waarom: Je wilt oogsten op n=3
+# n=3, Δ, n=3, De Metric:
+# Maar de ongerealiseerde winst bij  moet groter zijn dan 2x Taker fee (0.05%) + 1x Maker fee (0.02%) = ~0.12% van je 
+# positie. Als de gemiddelde  price van  kleiner is dan dat, gooi je geld weg.
+# Bereken per streak-lengte de ratio van de netto winst (na fees) ten opzichte van de bruto winst.
+
+def calculate_fee_adjusted_edge(price_moves, fee_rate_taker=0.0004, fee_rate_maker=0.0002):
+    """
+    berekent of een streak winstgevend is na fees.
+    We gaan uit van 1 maker entry, en 1 taker entry (de harvest).
+    """
+    edge_stats = {}
+    for s, deltas in price_moves.items():
+        arr = np.array(deltas)
+        # aproximeer de gemiddelde instapprijs (we gebruiken de mediaan van de delta als proxy)
+        # In een echte bot pak je de absoulte prijs, maar voor relatieve sterkte is dit voldoende.
+        median_delta = np.median(arr)
+
+        # Fee kosten als benadering van percentage van de move
+        total_fee_cost = median_delta * (fee_rate_maker + fee_rate_taker)
+
+        net_profit = median_delta - total_fee_cost
+        edge_ratio = net_profit / median_delta if median_delta > 0 else 0
+
+        edge_stats[s] = {
+            "median_gross": float(median_delta),
+            "est_fee_cost": float(total_fee_cost),
+            "median_net": float(net_profit),
+            "edge_ratio": float(edge_ratio),
+            "is_profitable_after_fees": bool(edge_ratio > 0)
+        }
+    return edge_stats
+
+# 2. Maximum Adverse Excursion (MAE) per Streak (De Mode 8 Fallback Validator)
+#
+# Waarom: In Mode 8 zet je Limit orders als fallback. Als een breakout faalt, zakt de prijs in je fallback grid. Hoe 
+# diep zakt hij gemiddeld door je grid voordat hij weer omhoog gaat? Dit bepaalt exact hoeveel DCA levels je nodig 
+# hebt.
+# De Metric: Meet de maximale terugtrekking (retrace) tijdens een streak, voordat de streak eindigt.
+
+def calculate_mae_per_streak(prices, event_times, streak_sequence, streak_start_idx, streak_end_idx):
+    """
+    Berekent de Maximum Adverse Excursion tijdens een streak.
+    Hoe ver ging de prijs de verkeerde kant op voordat de streak brak?
+    """
+    mae_stats = {}
+    
+    for i, (length, s_idx, e_idx) in enumerate(zip(streak_sequence, streak_start_idx, streak_end_idx)):
+        if length < 2 or s_idx >= e_idx:
+            continue
+            
+        # Bepaal richting van de streak op basis van de eerste 2 prijzen
+        start_price = prices[s_idx]
+        next_price = prices[s_idx + 1]
+        direction = 1 if next_price > start_price else -1
+        
+        # Zoek de laagste/hoogste prijs binnen de streak
+        streak_prices = np.array(prices[s_idx:e_idx+1])
+        
+        if direction == 1: # UP streak
+            # MAE is de daling vanaf het begin
+            mae = start_price - np.min(streak_prices)
+        else: # DOWN streak
+            # MAE is de stijging vanaf het begin
+            mae = np.max(streak_prices) - start_price
+            
+        mae_stats.setdefault(length, []).append(abs(mae))
+
+    # Aggregeer
+    mae_summary = {}
+    for s, arr in mae_stats.items():
+        arr = np.array(arr)
+        mae_summary[s] = {
+            "mae_p50": float(np.percentile(arr, 50)),
+            "mae_p90": float(np.percentile(arr, 90)),
+            "mae_max": float(arr.max())
+        }
+    return mae_summary
+
+#3. Tick Velocity Clustering (De API Stress Proxy)
+#
+# Waarom: Je zei zelf: "Als Binance errors gooit, is er een crash." Ook zonder API errors kun je in de data zien dat 
+# de markt onder druk staat door de snelheid van de ticks. Een n=3
+# De Metric: binnen streak die in 0.1 seconden gebeurt, is veel gevaarlijker (en winstgevender) dan eentje die 10 
+# seconden duurt. Bereken de interarrival tijd (in ms) per tick  een streak. Vergelijk de eerste tick met de latere 
+# ticks.
+
+# Als de acceleration_factor < 1 is (de rest van de ticks is sneller dan de eerste), zit je in een momentum cascade. 
+# Jouw bot kan dan besluiten: "We zitten in een snelle crash, ik mag meteen blindelings market orders gaan hameren."
+
+def calculate_velocity_stats(event_times, streak_start_idx, streak_end_idx):
+    """
+    Meet of ticks versnellen tijdens een streak (acceleratie = momentum).
+    """
+    velocity_stats = {}
+    for s, s_idx, e_idx in zip(streak_sequence, streak_start_idx, streak_end_idx):
+        if e_idx - s_idx < 2:
+            continue
+            
+        timestamps = np.array(event_times[s_idx:e_idx+1])
+        iats = np.diff(timestamps) * 1000  # naar milliseconden
+        
+        # Snelheid van de eerste 2 ticks vs de rest
+        first_iat = np.mean(iats[:2]) if len(iats) >= 2 else iats[0]
+        rest_iat = np.mean(iats[2:]) if len(iats) > 2 else first_iat
+        
+        velocity_stats.setdefault(s, []).append({
+            "first_tick_ms": float(first_iat),
+            "rest_tick_ms": float(rest_iat),
+            "acceleration_factor": float(first_iat / rest_iat) if rest_iat > 0 else 1.0
+        })
+    return velocity_stats
+
+#4. Asymmetry Index (Bull vs Bear Micro-structuur)
+#
+# Waarom: In crypto zijn dumps sneller en brutaler dan pumps. Jouw bot moet asymmetrische parameters hebben voor 
+# Longs en Shorts. 
+# De Metric: Vergelijk de p90 van UP streaks met de p90 van DOWN streaks op hetzelfde level.
+
+def calculate_asymmetry_index(up_data, down_data):
+    """
+    Berekent of de markt sneller daalt dan stijgt op micro-niveau.
+    """
+    asymmetry = {}
+    for s in sorted(set(list(up_data.keys()) + list(down_data.keys()))):
+        up_arr = np.array(up_data.get(s, []))
+        down_arr = np.array(down_data.get(s, []))
+        
+        if len(up_arr) == 0 or len(down_arr) == 0:
+            continue
+            
+        up_p90 = np.percentile(up_arr, 90)
+        down_p90 = np.percentile(down_arr, 90)
+        
+        asymmetry[s] = {
+            "up_p90": float(up_p90),
+            "down_p90": float(down_p90),
+            "bearish_bias": float(down_p90 / up_p90) if up_p90 > 0 else 0
+        }
+        # Als bearish_bias > 1.0, vallen de neerwaartse streaks harder uit.
+        # De bot kan voor SHORT breakouts een grotere spacing aanhouden dan voor LONG.
+    return asymmetry
+
+#5. Continuation Probability Matrix (De "Volgende Stap" Calculator)
+#
+# Waarom: Je wilt de wiskundige grens bepalen van je parabool. Als je op n=3  zit, wat is de exacte kans dat je n=4
+# haalt? Als die kans onder de 30% zakt, is je afroom-percentage op n=3 (50%) wiskundig gerechtvaardigd.
+
+def calculate_continuation_probability(streak_sequence):
+    """
+    Berekent P(Streak = N+1 | Streak = N)
+    """
+    prob_matrix = {}
+    counts = Counter(streak_sequence)
+    
+    for i in range(len(streak_sequence) - 1):
+        n = streak_sequence[i]
+        prob_matrix.setdefault(n, {"total": 0, "continued": 0})
+        prob_matrix[n]["total"] += 1
+        if streak_sequence[i+1] == n + 1:
+            prob_matrix[n]["continued"] += 1
+            
+    probabilities = {}
+    for n, data in prob_matrix.items():
+        probabilities[n] = float(data["continued"] / data["total"]) if data["total"] > 0 else 0.0
+        
+    return probabilities
+
+#6. Time-to-Resolution (TTR) per Streak
+#
+# Waarom dit essentieel is: Voor je "API Hammering" logica. Als een n=3 streak gemiddeld 50 milliseconden duurt, 
+# móét je bot Market Taker orders gebruiken en doorhammen, want een Limit order is te traag. Duurt een n=3
+# streak echter 2 seconden, dan kun je rustig een Maker Limit order uitschrijven en fees besparen.
+# De Metric: De absolute duur (in ms) van het begin van de eerste tick tot het einde van de streak.
+
+def calculate_ttr_per_streak(event_times, streak_sequence, streak_start_idx, streak_end_idx):
+    """
+    Meet de duur van een streak in milliseconden.
+    """
+    ttr_stats = {}
+    
+    for length, s_idx, e_idx in zip(streak_sequence, streak_start_idx, streak_end_idx):
+        if e_idx <= s_idx:
+            continue
+        start_ts = event_times[s_idx]
+        end_ts = event_times[e_idx]
+        duration_ms = (end_ts - start_ts) * 1000.0
+        
+        ttr_stats.setdefault(length, []).append(duration_ms)
+
+    ttr_summary = {}
+    for s, arr in ttr_stats.items():
+        arr = np.array(arr)
+        ttr_summary[s] = {
+            "ttr_p10": float(np.percentile(arr, 10)), # Snelste 10%
+            "ttr_p50": float(np.percentile(arr, 50)), # Mediaan
+            "ttr_p90": float(np.percentile(arr, 90))  # Traagste 10%
+        }
+    return ttr_summary
+
+# 7. Directional Autocorrelation (Trend vs Mean-Reversion Indicator)
+#
+# Waarom dit essentieel is: Je hebt al autocorrelatie op streak lengtes, maar we willen weten of de richting (UP/DOWN) 
+# clustert. Komt na een UP-streak vaker een UP-streak (momentum/trend)? Of komt na een UP-streak vaker een DOWN-streak 
+# (mean reversion/chop)? Dit bepaalt of je bot agressief moet doorladderen (Mode 8 breakout) of juist moet scalpen.
+# De Metric: Lag-1 autocorrelatie op de +/- 1 tekens van de streak richting.
+
+def calculate_directional_autocorrelation(streak_directions):
+    """
+    Berekent of de markt neigt naar trend-following (>0) of mean-reversion (<0).
+    streak_directions: een lijst van +1 (UP) of -1 (DOWN)
+    """
+    if len(streak_directions) < 2:
+        return 0.0
+        
+    dirs = np.array(streak_directions)
+    mean = dirs.mean()
+    if mean == 0: # Perfecte 50/50 verdeling
+        numerator = np.sum(dirs[:-1] * dirs[1:])
+        denominator = len(dirs) - 1
+    else:
+        numerator = np.sum((dirs[:-1] - mean) * (dirs[1:] - mean))
+        denominator = np.sum((dirs - mean) ** 2)
+        
+    if denominator == 0:
+        return 0.0
+        
+    return float(numerator / denominator)
+
+# 8. Micro-Fakeout Ratio (De Mode 8 Trigger)
+#
+# Waarom dit essentieel is: Je Mode 8 idee (Breakout + Fallback) leeft van fakeouts. Hoe vaak breekt de prijs precies 
+# 1 level (n=1 of n=2) en keert dan keihard om? Als dit percentage hoog is, mag je je afroom-pas zeker niet op n=2
+# zetten, maar moet je hem op n=3 of n=4 zetten.
+# De Metric: De ratio van streaks die exact eindigen op lengte 1 of 2, ten opzichte van streaks die lengte 3 of hoger 
+# halen.
+
+def calculate_fakeout_ratio(bins):
+    """
+    Berekent de kans dat een breakout faalt voordat n=3.
+    """
+    total = sum(bins.values())
+    if total == 0:
+        return 0.0
+        
+    fakeouts = bins.get(1, 0) + bins.get(2, 0)
+    breakouts = sum(v for k, v in bins.items() if k >= 3)
+    
+    return float(fakeouts / (fakeouts + breakouts)) if (fakeouts + breakouts) > 0 else 0.0
+
+# 9. Streak length statistics >>
+#
+# schrijf dan eens een stukkie code erbij om de timing van elke streak (n=1, n=2, n=3, n=4 etc te bepalen en dan apart 
+# daar de p90, median etc van), dan hebben we direct hoe lang streaks gemiddeld duren 
+
+import numpy as np
+
+def calculate_streak_timing_stats(event_times, streak_sequence, streak_start_idx, streak_end_idx):
+    """
+    Berekent de duur (in milliseconden) van elke streak en groepeert deze per streak-lengte.
+    Geeft statistieken terug (min, max, mean, median, p10, p90, etc.) per lengte.
+    """
+    timing_stats = {}
+
+    # Loop door alle gevonden streaks
+    for length, s_idx, e_idx in zip(streak_sequence, streak_start_idx, streak_end_idx):
+        # Basis checks (skip als indices niet kloppen)
+        if e_idx <= s_idx or e_idx >= len(event_times) or s_idx >= len(event_times):
+            continue
+
+        start_ts = event_times[s_idx]
+        end_ts = event_times[e_idx]
+        
+        # Duur in milliseconden
+        duration_ms = (end_ts - start_ts) * 1000.0
+        
+        # Groepeer per streak lengte
+        timing_stats.setdefault(length, []).append(duration_ms)
+
+    # Bereken statistieken per streak lengte
+    timing_summary = {}
+    for s, durations in sorted(timing_stats.items()):
+        arr = np.array(durations)
+        
+        timing_summary[s] = {
+            "count": int(len(arr)),
+            "min_ms": float(arr.min()),
+            "max_ms": float(arr.max()),
+            "mean_ms": float(arr.mean()),
+            "median_ms": float(np.median(arr)),
+            "p10_ms": float(np.percentile(arr, 10)),  # Snelste 10% (extreme velocity)
+            "p25_ms": float(np.percentile(arr, 25)),
+            "p50_ms": float(np.percentile(arr, 50)),
+            "p75_ms": float(np.percentile(arr, 75)),
+            "p90_ms": float(np.percentile(arr, 90)),  # Traagste 10% (DODOde markt)
+            "p99_ms": float(np.percentile(arr, 99))
+        }
+
+    return timing_summary
+
+# 10. jamaja, berekent je code per streak length de p10_ms tot p90_ms ... of misschien nog beter: kunnen we van die 
+# lengte ook geen violin plots maken ? 
+# Ja, absoluut! Dat is zelfs een veel beter idee dan alleen de p10/p90 getallen. Een violin plot laat niet alleen de 
+# mediaan en de percentielen zien, maar ook de vorm van de distributie. 
+#
+# Stel dat een n=3 streak twee pieken heeft (bimodiaal): één piek op 5ms (de HFT flash crashes) en één piek op 2000ms 
+# (normale volatiliteit). Een simpel p10/p90 getal verbergt die structuur, maar een violin plot verraadt direct dat je 
+# bot twee totaal verschillende executie-modi nodig heeft.
+#
+# Hier is de code om prachtige violin plots van de streak-timing te maken. Ik heb er direct een logaritmische schaal 
+# aan toegevoegd, omdat timings in de micro-structuur van 1 milliseconde tot 10 seconden lopen, en je anders alles 
+# geplet ziet onderaan de grafiek.
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.ticker import ScalarFormatter
+
+def plot_streak_timing_violins(event_times, streak_sequence, streak_start_idx, streak_end_idx, max_streak=12):
+    """
+    Maakt een violin plot van de duur (in ms) per streak lengte.
+    Omdat timings enorm variëren (1ms tot 10s) gebruiken we een log-y as.
+    """
+    timing_data = {}
+
+    # 1. Verzamel ruwe data per streak length
+    for length, s_idx, e_idx in zip(streak_sequence, streak_start_idx, streak_end_idx):
+        if e_idx <= s_idx or e_idx >= len(event_times) or s_idx >= len(event_times):
+            continue
+        
+        # Beperk tot max_streak om de grafiek leesbaar te houden
+        if length > max_streak:
+            continue
+            
+        start_ts = event_times[s_idx]
+        end_ts = event_times[e_idx]
+        duration_ms = (end_ts - start_ts) * 1000.0
+        
+        # Filter ongeldige timings eruit (soms kloppen CSV timestamps niet)
+        if duration_ms > 0:
+            timing_data.setdefault(length, []).append(duration_ms)
+
+    if not timing_data:
+        print("Geen timing data beschikbaar voor violin plot.")
+        return None
+
+    # Sorteer op streak length
+    sorted_lengths = sorted(timing_data.keys())
+    
+    # Data voorbereiden voor matplotlib
+    data_to_plot = [timing_data[s] for s in sorted_lengths]
+    positions = np.arange(1, len(sorted_lengths) + 1)
+
+    # 2. Maak de plot
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Violins tekenen
+    vp = ax.violinplot(data_to_plot, positions=positions, showmeans=False, showmedians=False, showextrema=False)
+    
+    # Styling van de violins
+    for body in vp['bodies']:
+        body.set_facecolor("teal")
+        body.set_edgecolor("black")
+        body.set_alpha(0.7)
+
+    # 3. Quantiles toevoegen (p10, p50, p90) als dikke markers
+    for i, data in enumerate(data_to_plot):
+        if len(data) == 0:
+            continue
+        pos = positions[i]
+        
+        p10 = np.percentile(data, 10)
+        p50 = np.percentile(data, 50) # Mediaan
+        p90 = np.percentile(data, 90)
+        
+        # Teken de markers
+        ax.scatter(pos, p10, marker="_", color="blue", s=200, linewidths=2, zorder=3, label="p10 (Snelste)" if i == 0 else "")
+        ax.scatter(pos, p50, marker="_", color="white", s=200, linewidths=2, zorder=3, label="p50 (Mediaan)" if i == 0 else "")
+        ax.scatter(pos, p90, marker="_", color="red", s=200, linewidths=2, zorder=3, label="p90 (Traagste)" if i == 0 else "")
+
+    # 4. Opmaak
+    ax.set_xticks(positions)
+    ax.set_xticklabels([f"n={s}" for s in sorted_lengths])
+    ax.set_xlabel("Streak Lengte (n)")
+    ax.set_ylabel("Duur in milliseconden (ms)")
+    ax.set_title("Streak Duur Distributie per Lengte (Log Schaal)\nBlauw=p10 | Wit=p50 | Rood=p90")
+    
+    # Log schaal is essentieel voor timings!
+    ax.set_yscale("log")
+    
+    # Forceer normale getallen (1, 10, 100) in plaats van 10^1, 10^2
+    ax.yaxis.set_major_formatter(ScalarFormatter())
+    ax.ticklabel_format(style='plain', axis='y')
+    
+    ax.grid(axis="y", alpha=0.3, which="both")
+    ax.legend(loc="upper right")
+
+    plt.tight_layout()
+    return fig
+
+# 11. Streak Path Efficiency (SPE) - De "Laser" vs de "Zager"
+#
+# Waarom de bot dit nodig heeft: 
+# In je Mode 8 (Breakout + Fallback) wil je weten of een n=3 breakout een "schone" breakout is. Beweegt de prijs in 3 
+# rechte ticks omhoog (een laser), of stuitert hij onderweg iets naar beneden en dan pas omhoog (een zaag)? Als de 
+# breakout efficiënt is (weinig ruis), kun je je Fallback Grid verder van de prijs zetten. Als het een zaag is, moet 
+# je fallback grid dichter bij elkaar staan, want de prijs wiebelt sneller door je levels heen.
+# De Metric: De verhouding tussen de nettobeweging en de bruto afgelegde weg per tick.
+
+def calculate_path_efficiency(prices, streak_start_idx, streak_end_idx):
+    """
+    Meet hoe 'efficiënt' de prijs beweegt tijdens een streak.
+    1.0 = perfecte rechte lijn (laser). Lage waarden = veel ruis (zaag).
+    """
+    efficiency_stats = {}
+    
+    for length, s_idx, e_idx in zip(streak_sequence, streak_start_idx, streak_end_idx):
+        if length < 2 or e_idx <= s_idx or e_idx >= len(prices):
+            continue
+            
+        # Pak alle prijzen binnen deze streak
+        streak_prices = np.array(prices[s_idx:e_idx+1])
+        
+        # Netto beweging (beginpunt tot eindpunt)
+        net_move = abs(streak_prices[-1] - streak_prices[0])
+        
+        # Bruto beweging (som van alle absolute verschillen per tick)
+        gross_move = np.sum(np.abs(np.diff(streak_prices)))
+        
+        if gross_move > 0:
+            eff = net_move / gross_move
+            efficiency_stats.setdefault(length, []).append(eff)
+
+    # Samenvatten
+    summary = {}
+    for s, arr in efficiency_stats.items():
+        arr = np.array(arr)
+        summary[s] = {
+            "efficiency_p50": float(np.percentile(arr, 50)),
+            "efficiency_p10": float(np.percentile(arr, 10)) # De ruisigste breakouts
+        }
+    return summary
+
+# 12. Intra-Streak Tick Acceleration (Momentum Uitputting)
+# 
+# Waarom de bot dit nodig heeft: Je bot oogst op n=3. Maar stel dat n=3 is bereikt, moet de bot dan wachten op n=4
+# of alvast winst nemen? Als de ticks vertragen aan het einde van de n=3 streak, is het momentum uitgeput en keert de 
+# prijs waarschijnlijk om. Blijft de snelheid constant of versnelt hij? Dan moet de bot wachten op n=4
+#
+# De Metric: Vergelijk de gemiddelde interarrival tijd (ms) van de eerste helft van de streak met de tweede helft.
+
+# Bot Beslissing: Als accel_p50 op n=3
+#  boven de 1.5 ligt, betekent dit dat de streak drastisch vertraagt. De C-bot moet op dat moment direct de 
+# oogst-market-order uitschrijven, omdat de breakout stikt.
+
+def calculate_tick_acceleration(event_times, streak_start_idx, streak_end_idx):
+    """
+    Meet of ticks versnellen of vertragen tijdens een streak.
+    Ratio < 1.0 = Versnelling (Momentum neemt toe)
+    Ratio > 1.0 = Vertraging (Momentum stopt, time to harvest!)
+    """
+    accel_stats = {}
+    
+    for length, s_idx, e_idx in zip(streak_sequence, streak_start_idx, streak_end_idx):
+        if length < 4 or e_idx <= s_idx: # Hebben minimaal 4 ticks nodig voor een betrouwbare meting
+            continue
+            
+        timestamps = np.array(event_times[s_idx:e_idx+1])
+        iats = np.diff(timestamps) * 1000.0 # naar ms
+        
+        # Splits de streak in tweeën
+        midpoint = len(iats) // 2
+        if midpoint == 0:
+            continue
+            
+        first_half_speed = np.mean(iats[:midpoint])
+        second_half_speed = np.mean(iats[midpoint:])
+        
+        if first_half_speed > 0:
+            ratio = second_half_speed / first_half_speed
+            accel_stats.setdefault(length, []).append(ratio)
+
+    summary = {}
+    for s, arr in accel_stats.items():
+        arr = np.array(arr)
+        summary[s] = {
+            "accel_p50": float(np.percentile(arr, 50)),
+            "accel_p90": float(np.percentile(arr, 90)) # Traagheid aan het einde
+        }
+    return summary
+
+# 13. Counter-Strike Velocity (De "Slingshot" / V-orm)
+# 
+# Waarom de bot dit nodig heeft: Dit is de ultieme test voor je API Hammer module. Als een n=3  UP streak breekt, 
+# hoe hard crasht hij dan naar beneden? Als de eerste tick van de tegenstreak gigantisch is (bijv. een slingshot 
+# van 2% in 1 tick), weet de bot dat hij geen tijd heeft om netjes orders te plaatsen, maar direct in de "panic 
+# hammer" modus moet schieten.
+# De Metric: De absolute delta en de duur (ms) van de allereerste tick van de tegenstreak na een streak van n≥3
+
+def calculate_slingshot_velocity(prices, event_times, streak_sequence, streak_end_idx):
+    """
+    Meet hoe hard de markt terugkaatst (of doorzakt) direct na een streak break.
+    """
+    slingshot_stats = {}
+    
+    # We hebben de index ná het einde van de streak nodig
+    for i in range(len(streak_sequence) - 1):
+        length = streak_sequence[i]
+        if length < 3: # We meten alleen de slingshot na een significante breakout (n>=3)
+            continue
+            
+        e_idx = streak_end_idx[i]
+        next_idx = e_idx + 1
+        
+        if next_idx >= len(prices):
+            continue
+            
+        # De prijs aan het einde van de streak, en de eerste tick erna
+        break_price = prices[e_idx]
+        slingshot_price = prices[next_idx]
+        
+        # De tijd die het kostte
+        time_ms = (event_times[next_idx] - event_times[e_idx]) * 1000.0
+        
+        delta = abs(slingshot_price - break_price)
+        
+        slingshot_stats.setdefault(length, []).append({
+            "delta": delta,
+            "time_ms": time_ms
+        })
+
+    summary = {}
+    for s, data in slingshot_stats.items():
+        deltas = np.array([d["delta"] for d in data])
+        times = np.array([d["time_ms"] for d in data])
+        
+        summary[s] = {
+            "slingshot_delta_p90": float(np.percentile(deltas, 90)), # Hardste klap
+            "slingshot_time_p10": float(np.percentile(times, 10))    # Snelste klap (ms)
+        }
+    return summary
+
+# 14. Theoretical maximal profit
+# Dit is de ultieme "Sanity Check". Door de theoretische maximale winst te berekenen (een perfecte backtest in een 
+# vacuüm zonder fees, latency of slippage), bepaal je het absolute plafond van je strategie. 
+#
+# Als deze simulatie op een dag 50% winst laat zien, weet je: "Oké, zelfs als ik de helft verlies aan frictie, maak 
+# ik nog 25%." Als de simulatie echter 2% per dag oplevert, weet je dat de strategie na fees en latency waarschijnlijk 
+# verliesdraaiend is.
+#
+# Hier is de Python code voor een Perfect Execution Simulator. Hij loopt door je ruwe tick-data, simuleert de grid 
+# levels, telt de n-streaks, hanteert jouw n=3 afroom-matrix, en berekent de winst door het gemiddelde van je mandje 
+# (BEP) op te schuiven.
+
+import numpy as np
+
+def simulate_theoretical_max_profit(prices, grid_spacing, harvest_n=3, harvest_pct=0.40, order_size=1.0):
+    """
+    Simuleer deperfecte uitvoering van de n=3 afroom-strategie.
+    - Geen fees, geen latency, geen slippage.
+    - Volgt de regels: ladderen bij grid cross, afroomen bij streak >= harvest_n.
+    """
+    if len(prices) < 2:
+        return {"total_profit": 0.0, "total_orders": 0, "total_harvests": 0}
+
+    # State variables
+    last_cross_price = prices[0]
+    direction = 0      # 1 = UP, -1 = DOWN
+    streak = 0
+    
+    pos_size = 0.0
+    pos_value = 0.0    # Totaal investering (om gemiddelde prijs te berekenen)
+    realized_pnl = 0.0 # Afgeroomde winst op de bank
+    
+    total_orders = 0
+    total_harvests = 0
+
+    for p in prices[1:]:
+        # Check voor UP grid cross
+        if p >= last_cross_price + grid_spacing:
+            cross_price = last_cross_price + grid_spacing
+            
+            # 1. Laddering (Positie vergroten)
+            pos_size += order_size
+            pos_value += cross_price * order_size
+            total_orders += 1
+            
+            # 2. Streak logic
+            if direction != 1:
+                direction = 1
+                streak = 1
+            else:
+                streak += 1
+                
+            last_cross_price = cross_price
+            
+            # 3. Afroom Logica (Harvest)
+            if streak >= harvest_n and pos_size > 0:
+                avg_price = pos_value / pos_size
+                profit_per_unit = cross_price - avg_price
+                unrealized = profit_per_unit * pos_size
+                
+                if unrealized > 0:
+                    pnl_to_take = unrealized * harvest_pct
+                    # Hoeveel units moeten we verkopen om deze winst te pakken?
+                    vol_to_sell = pnl_to_take / (cross_price - avg_price)
+                    
+                    # Positie verkleinen en waarde aanpassen
+                    pos_size -= vol_to_sell
+                    pos_value -= vol_to_sell * avg_price
+                    realized_pnl += pnl_to_take
+                    total_harvests += 1
+
+        # Check voor DOWN grid cross
+        elif p <= last_cross_price - grid_spacing:
+            cross_price = last_cross_price - grid_spacing
+            
+            # 1. Laddering (Short posities vergroten in een breakout naar beneden)
+            pos_size += order_size
+            # Bij een short betekent dit dat we het verkopen, dus pos_value gaat omlaag
+            pos_value -= cross_price * order_size
+            total_orders += 1
+            
+            # 2. Streak logic
+            if direction != -1:
+                direction = -1
+                streak = 1
+            else:
+                streak += 1
+                
+            last_cross_price = cross_price
+            
+            # 3. Afroom Logica (Harvest)
+            if streak >= harvest_n and pos_size > 0:
+                # Voor shorts is de gemiddelde prijs de prijs waarop we short gegaan zijn
+                avg_price = pos_value / pos_size
+                # Winst is (instap - huidig)
+                profit_per_unit = avg_price - cross_price
+                unrealized = profit_per_unit * pos_size
+                
+                if unrealized > 0:
+                    pnl_to_take = unrealized * harvest_pct
+                    vol_to_buy = pnl_to_take / (avg_price - cross_price)
+                    
+                    pos_size -= vol_to_buy
+                    pos_value -= vol_to_buy * avg_price
+                    realized_pnl += pnl_to_take
+                    total_harvests += 1
+
+    # Einde van de dag: sluit resterende open positie af tegen de laatste prijs
+    final_price = prices[-1]
+    if pos_size > 0.0001:
+        if direction == 1: # Long positie sluiten
+            unrealized_end = (final_price - (pos_value/pos_size)) * pos_size
+        else: # Short positie sluiten
+            unrealized_end = ((pos_value/pos_size) - final_price) * pos_size
+            
+        realized_pnl += max(0, unrealized_end) # We tellen alleen de winst, geen verlies voor theoretisch max
+
+    return {
+        "total_profit_units": float(realized_pnl),
+        "total_profit_pct": float(realized_pnl / (prices[0] * 1.0) * 100), # Als % van startprijs
+        "total_orders": int(total_orders),
+        "total_harvests": int(total_harvests),
+        "avg_profit_per_order": float(realized_pnl / total_orders) if total_orders > 0 else 0
+    }
+
+# 15. Theoretical max profit (model 2)
+
+import numpy as np
+
+def simulate_theoretical_max_profit2(prices, grid_spacing_pct, harvest_n=3, harvest_pct=0.40, order_size=1.0):
+    """
+    Simuleer de perfecte uitvoering van de afroom-strategie.
+    - Geen fees, geen latency, geen slippage.
+    - Reset de positie (sluit alles) zodra de streak breekt (richting omkeert).
+    """
+    if len(prices) < 2:
+        return 0.0, 0, 0
+
+    # Bepaal absolute spacing op basis van percentage
+    start_price = prices[0]
+    grid_spacing = start_price * (grid_spacing_pct / 100.0)
+
+    last_cross_price = start_price
+    direction = 0  # 1 = UP, -1 = DOWN
+    streak = 0
+    
+    pos_size = 0.0
+    pos_cost_basis = 0.0  # Totaal investering (long) of opbrengst (short)
+    realized_pnl = 0.0
+    
+    total_orders = 0
+    total_harvests = 0
+
+    def close_position(price):
+        """Sluit de hele positie en bereken winst/verlies."""
+        nonlocal pos_size, pos_cost_basis, realized_pnl
+        if pos_size > 0:
+            if direction == 1: # Long sluiten
+                realized_pnl += (price - (pos_cost_basis/pos_size)) * pos_size
+            elif direction == -1: # Short sluiten
+                realized_pnl += ((pos_cost_basis/pos_size) - price) * pos_size
+            pos_size = 0
+            pos_cost_basis = 0
+
+    for p in prices[1:]:
+        # UP grid cross
+        if p >= last_cross_price + grid_spacing:
+            cross_price = last_cross_price + grid_spacing
+            
+            # Als we van richting wisselen, sluiten we de oude positie
+            if direction != 1:
+                close_position(cross_price)
+                direction = 1
+                streak = 1
+            else:
+                streak += 1
+                
+            # 1. Laddering (Positie vergroten)
+            pos_size += order_size
+            pos_cost_basis += cross_price * order_size
+            total_orders += 1
+            last_cross_price = cross_price
+            
+            # 2. Afroom Logica (Harvest)
+            if streak >= harvest_n and pos_size > 0:
+                avg_price = pos_cost_basis / pos_size
+                unrealized = (cross_price - avg_price) * pos_size
+                if unrealized > 0:
+                    pnl_to_take = unrealized * harvest_pct
+                    vol_to_sell = pnl_to_take / (cross_price - avg_price)
+                    pos_size -= vol_to_sell
+                    pos_cost_basis -= vol_to_sell * avg_price
+                    realized_pnl += pnl_to_take
+                    total_harvests += 1
+
+        # DOWN grid cross
+        elif p <= last_cross_price - grid_spacing:
+            cross_price = last_cross_price - grid_spacing
+            
+            if direction != -1:
+                close_position(cross_price)
+                direction = -1
+                streak = 1
+            else:
+                streak += 1
+                
+            # 1. Laddering (Short positie vergroten)
+            pos_size += order_size
+            pos_cost_basis += cross_price * order_size
+            total_orders += 1
+            last_cross_price = cross_price
+            
+            # 2. Afroom Logica (Harvest)
+            if streak >= harvest_n and pos_size > 0:
+                avg_price = pos_cost_basis / pos_size
+                unrealized = (avg_price - cross_price) * pos_size
+                if unrealized > 0:
+                    pnl_to_take = unrealized * harvest_pct
+                    vol_to_buy = pnl_to_take / (avg_price - cross_price)
+                    pos_size -= vol_to_buy
+                    pos_cost_basis -= vol_to_buy * avg_price
+                    realized_pnl += pnl_to_take
+                    total_harvests += 1
+
+    # Sluit resterende open positie aan einde van de dag
+    close_position(prices[-1])
+
+    return realized_pnl, total_orders, total_harvests
+
+
+def run_parameter_optimization_loop(prices):
+    """
+    Voert een grid-search uit om de optimale spacing en harvest N te vinden.
+    """
+    if len(prices) < 100:
+        print("Niet genoeg data voor optimalisatie.")
+        return
+
+    # De spacings (in %) die we willen testen
+    spacings_to_test = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0]
+    # De harvest momenten (n) die we willen testen
+    harvest_ns_to_test = [2, 3, 4, 5, 6]
+    
+    harvest_pct = 0.40 # vaste afroom ratio
+    order_size = 1.0
+
+    print("\n" + "="*80)
+    print(" THEORETISCHE MAX WINST OPTIMALISATIE (Perfect Execution) ".center(80))
+    print("="*80)
+    print(f" Startprijs: {prices[0]:.2f} | Data Points: {len(prices)} | Afroom: {harvest_pct*100:.0f}%")
+    print("-" * 80)
+    print(f"{'Spacing %':<12} | {'Harvest N':<12} | {'Winst (units)':<15} | {'Winst %':<10} | {'# Orders':<10} | {'# Oogsten':<10}")
+    print("-" * 80)
+
+    results = []
+    
+    for spacing_pct in spacings_to_test:
+        for n_harvest in harvest_ns_to_test:
+            pnl, orders, harvests = simulate_theoretical_max_profit2(
+                prices, 
+                grid_spacing_pct=spacing_pct, 
+                harvest_n=n_harvest, 
+                harvest_pct=harvest_pct,
+                order_size=order_size
+            )
+            
+            pnl_pct = (pnl / prices[0]) * 100
+            results.append((spacing_pct, n_harvest, pnl, pnl_pct, orders, harvests))
+            
+            print(f"{spacing_pct:<12.2f} | {n_harvest:<12} | {pnl:<15.4f} | {pnl_pct:<10.2f} | {orders:<10} | {harvests:<10}")
+            
+    print("-" * 80)
+    
+    # Vind de absolute winnaar
+    best_result = max(results, key=lambda x: x[3])
+    print(f"\n=> WINNAAR: Spacing {best_result[0]:.2f}% | n={best_result[1]} | Winst: {best_result[3]:.2f}%")
+    print("=> (Let op: Dit is zonder fees. Halveer dit getal voor een realistische bot verwachting)\n")
+
+
+# 16. Theoretical max profit #3
+
+import numpy as np
+
+def simulate_theoretical_max_profit_absolute(prices, grid_spacing, harvest_n=3, harvest_pct=0.40, order_size=1.0):
+    """
+    Simuleer de perfecte uitvoering met een absolute grid spacing.
+    Reset de positie (sluit alles) zodra de streak breekt (richting omkeert).
+    """
+    if len(prices) < 2 or grid_spacing <= 0:
+        return 0.0, 0, 0
+
+    last_cross_price = prices[0]
+    direction = 0  # 1 = UP, -1 = DOWN
+    streak = 0
+    
+    pos_size = 0.0
+    pos_cost_basis = 0.0  
+    realized_pnl = 0.0
+    
+    total_orders = 0
+    total_harvests = 0
+
+    def close_position(price):
+        nonlocal pos_size, pos_cost_basis, realized_pnl
+        if pos_size > 0:
+            if direction == 1: 
+                realized_pnl += (price - (pos_cost_basis/pos_size)) * pos_size
+            elif direction == -1: 
+                realized_pnl += ((pos_cost_basis/pos_size) - price) * pos_size
+            pos_size = 0
+            pos_cost_basis = 0
+
+    for p in prices[1:]:
+        # UP grid cross
+        if p >= last_cross_price + grid_spacing:
+            cross_price = last_cross_price + grid_spacing
+            if direction != 1:
+                close_position(cross_price)
+                direction = 1
+                streak = 1
+            else:
+                streak += 1
+                
+            pos_size += order_size
+            pos_cost_basis += cross_price * order_size
+            total_orders += 1
+            last_cross_price = cross_price
+            
+            if streak >= harvest_n and pos_size > 0:
+                avg_price = pos_cost_basis / pos_size
+                unrealized = (cross_price - avg_price) * pos_size
+                if unrealized > 0:
+                    pnl_to_take = unrealized * harvest_pct
+                    vol_to_sell = pnl_to_take / (cross_price - avg_price)
+                    pos_size -= vol_to_sell
+                    pos_cost_basis -= vol_to_sell * avg_price
+                    realized_pnl += pnl_to_take
+                    total_harvests += 1
+
+        # DOWN grid cross
+        elif p <= last_cross_price - grid_spacing:
+            cross_price = last_cross_price - grid_spacing
+            if direction != -1:
+                close_position(cross_price)
+                direction = -1
+                streak = 1
+            else:
+                streak += 1
+                
+            pos_size += order_size
+            pos_cost_basis += cross_price * order_size
+            total_orders += 1
+            last_cross_price = cross_price
+            
+            if streak >= harvest_n and pos_size > 0:
+                avg_price = pos_cost_basis / pos_size
+                unrealized = (avg_price - cross_price) * pos_size
+                if unrealized > 0:
+                    pnl_to_take = unrealized * harvest_pct
+                    vol_to_buy = pnl_to_take / (avg_price - cross_price)
+                    pos_size -= vol_to_buy
+                    pos_cost_basis -= vol_to_buy * avg_price
+                    realized_pnl += pnl_to_take
+                    total_harvests += 1
+
+    close_position(prices[-1])
+    return realized_pnl, total_orders, total_harvests
+
+
+def run_data_driven_optimization_loop(prices, price_moves):
+    """
+    Gebruikt de p25, p50 (mediaan), p75 en p90 van de n=1, n=2 en n=3 streaks
+    als grid spacing voor de theoretische simulatie.
+    """
+    if len(prices) < 100:
+        print("Niet genoeg data voor optimalisatie.")
+        return
+
+    # 1. Bepaal de kandidaat spacings op basis van echte streak data
+    spacings_to_test = {}
+    for n in [1, 2, 3]:
+        if n in price_moves and len(price_moves[n]) > 0:
+            arr = np.array(price_moves[n])
+            spacings_to_test[f"n{n}_p25"] = float(np.percentile(arr, 25))
+            spacings_to_test[f"n{n}_p50"] = float(np.percentile(arr, 50))
+            spacings_to_test[f"n{n}_p75"] = float(np.percentile(arr, 75))
+            spacings_to_test[f"n{n}_p90"] = float(np.percentile(arr, 90))
+
+    harvest_ns_to_test = [2, 3, 4]
+    harvest_pct = 0.40
+    order_size = 1.0
+
+    print("\n" + "="*90)
+    print(" DATA-DRIVEN THEORETISCHE MAX WINST (Gebaseerd op streak statistieken) ".center(90))
+    print("="*90)
+    print(f" Startprijs: {prices[0]:.2f} | Data Points: {len(prices)} | Afroom: {harvest_pct*100:.0f}%")
+    print("-" * 90)
+    print(f"{'Bron Statistiek':<15} | {'Abs. Spacing':<12} | {'Harvest N':<10} | {'Winst (units)':<15} | {'Winst %':<10} | {'# Orders':<10} | {'# Oogsten':<10}")
+    print("-" * 90)
+
+    results = []
+    
+    for stat_name, spacing_val in spacings_to_test.items():
+        for n_harvest in harvest_ns_to_test:
+            pnl, orders, harvests = simulate_theoretical_max_profit_absolute(
+                prices, 
+                grid_spacing=spacing_val, 
+                harvest_n=n_harvest, 
+                harvest_pct=harvest_pct,
+                order_size=order_size
+            )
+            
+            pnl_pct = (pnl / prices[0]) * 100
+            results.append((stat_name, spacing_val, n_harvest, pnl, pnl_pct, orders, harvests))
+            
+            print(f"{stat_name:<15} | {spacing_val:<12.6f} | {n_harvest:<10} | {pnl:<15.4f} | {pnl_pct:<10.2f} | {orders:<10} | {harvests:<10}")
+            
+    print("-" * 90)
+    
+    # Vind de absolute winnaar
+    best_result = max(results, key=lambda x: x[4])
+    print(f"\n=> WINNAAR: Bron={best_result[0]} ({best_result[1]:.6f}) | n={best_result[2]} | Winst: {best_result[4]:.2f}%")
+    print("=> (Let op: Dit is zonder fees. Halveer dit getal voor een realistische bot verwachting)\n")
+
 # ----------------------------
 # Main
 # ----------------------------
@@ -2496,7 +3469,7 @@ def main():
             raise FileNotFoundError(f"CSV not found: {args.csv}")
         csv_path = args.csv
     else:
-        csv_path = "trading_cloud/tick-data/BTCUSD/csv/BTCUSD_2025-04-01_0200GMT_merged_data_corrected.csv"
+        csv_path = "./testdata/BTCUSD-testdata.csv"
         if not os.path.exists(csv_path):
             print(f"Warning: Default CSV not found: {csv_path}")
             return
@@ -2517,7 +3490,8 @@ def main():
         outfile = "streaks_export.json"
 
     # TRANSITIES (trans) EN EXTRA DARA in json exporteren
-    export_json(pm, bins, outfile, csv_path, ticks, total_streaks, interarr, up, down)
+    # todo 21/07/2026 next line is debug commented out, should work in real code
+    #export_json(pm, bins, outfile, csv_path, ticks, total_streaks, interarr, up, down) 
 
 # DEBUG LINES:
 #    print("STREAK_SEQ:", streak_seq)
@@ -2657,7 +3631,34 @@ def main():
 
 #        fig25 = plot_top_cumulative_streaks_with_interarrival(event_times, streak_seq, interarr, top_n=5)
 
+# FIG26: Streak Timing Violins
+        fig26 = plot_streak_timing_violins(event_times, streak_seq, start_idx, end_idx, max_streak=12)
+
         plt.show()
+
+        run_parameter_optimization_loop(prices)
+        run_data_driven_optimization_loop(prices, pm)
+
+        # THEORETISCHE MAX WINST SIMULATIE
+        # Pak de gesuggereerde grid spacing
+        suggested_spacing = suggest_global_grid_width(pm, list(pm.keys()))
+        if suggested_spacing and suggested_spacing > 0:
+            print(f"\n=== Theoretische Max Winst Simulatie (Spacing: {suggested_spacing:.4f}) ===")
+            
+            # Simuleer met n=3 harvest, 40% afroom
+            sim_result = simulate_theoretical_max_profit(
+                prices, 
+                grid_spacing=suggested_spacing, 
+                harvest_n=3, 
+                harvest_pct=0.40,
+                order_size=1.0
+            )
+            
+            print(f"Totale orders getriggerd : {sim_result['total_orders']}")
+            print(f"Totale oogsten (n>=3)   : {sim_result['total_harvests']}")
+            print(f"Theoretische Winst      : {sim_result['total_profit_units']:.4f} units")
+            print(f"Theoretisch Rendement   : {sim_result['total_profit_pct']:.2f}% van startkapitaal")
+            print(f"Gem. winst per order    : {sim_result['avg_profit_per_order']:.4f} units")
 
 if __name__ == "__main__":
     main()

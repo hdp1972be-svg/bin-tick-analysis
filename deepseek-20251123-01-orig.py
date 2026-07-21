@@ -208,7 +208,7 @@ def create_percentile_profile(price_moves, streak_length=1, p_start=90, p_end=10
     return profile
 
 # Hoofdprogramma
-demo_tick_file = "trading_cloud/tick-data/BTCUSD/csv/BTCUSD_2025-04-01_0200GMT_merged_data_corrected.csv"
+demo_tick_file = "./testdata/BTCUSD-testdata.csv"
 bins, price_moves = read_csv(demo_tick_file)
 
 # Plot de basis statistieken

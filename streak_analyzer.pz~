@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/local/bin/python3.11
 import argparse
 import csv
 import numpy as np
@@ -988,7 +988,7 @@ def main():
             raise FileNotFoundError(f"CSV not found: {args.csv}")
         csv_path = args.csv
     else:
-        csv_path = "trading_cloud/tick-data/BTCUSD/csv/BTCUSD_2025-04-01_0200GMT_merged_data_corrected.csv"
+        csv_path = "./testdata/BTCUSD-testdata.csv"
         if not os.path.exists(csv_path):
             print(f"Warning: Default CSV not found: {csv_path}")
             return

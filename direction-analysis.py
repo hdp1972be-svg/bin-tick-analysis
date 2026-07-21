@@ -73,5 +73,5 @@ def read_csv(input_path):
 
     print(f"Total Lines: {lines}")
 
-demo_tick_file = "trading_cloud/tick-data/BTCUSD/csv/BTCUSD_2025-04-01_0200GMT_merged_data_corrected.csv"
+demo_tick_file = "./testdata/BTCUSD-testdata.csv"
 read_csv(demo_tick_file)

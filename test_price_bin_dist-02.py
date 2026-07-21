@@ -132,6 +132,6 @@ def print_stats(bins, price_moves, first_ticks, single_ticks, first_of_long_stre
 
 
 if __name__ == "__main__":
-    demo_tick_file = "trading_cloud/tick-data/BTCUSD/csv/BTCUSD_2025-04-01_0200GMT_merged_data_corrected.csv"
+    demo_tick_file = "./testdata/BTCUSD-testdata.csv"
     bins, price_moves, first_ticks, single_ticks, first_of_long_streaks = read_csv(demo_tick_file)
     print_stats(bins, price_moves, first_ticks, single_ticks, first_of_long_streaks)
